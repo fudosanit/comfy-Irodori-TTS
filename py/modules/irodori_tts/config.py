@@ -22,6 +22,10 @@ class ModelConfig:
     text_layers: int = 14
     text_heads: int = 10
     use_caption_condition: bool = False
+    # None means "derive from use_caption_condition" for legacy checkpoints that
+    # predate this flag being stored explicitly. v3+ checkpoints persist it and
+    # may enable both caption and speaker conditioning simultaneously.
+    use_speaker_condition: bool | None = None
     caption_vocab_size: int | None = None
     caption_tokenizer_repo: str | None = None
     caption_add_bos: bool | None = None
@@ -46,6 +50,15 @@ class ModelConfig:
     duration_token_init_frames: float = 9.0
     duration_speaker_fusion: str = "adarn_zero"
 
+    def __post_init__(self) -> None:
+        if self.use_speaker_condition is None:
+            # Legacy checkpoints omit this flag. Older voice-design models are
+            # caption-driven and intentionally omit reference-speaker
+            # conditioning, while plain clone models enable it.
+            self.use_speaker_condition = not bool(self.use_caption_condition)
+        else:
+            self.use_speaker_condition = bool(self.use_speaker_condition)
+
     @property
     def patched_latent_dim(self) -> int:
         return self.latent_dim * self.latent_patch_size
@@ -53,12 +66,6 @@ class ModelConfig:
     @property
     def speaker_patched_latent_dim(self) -> int:
         return self.patched_latent_dim * self.speaker_patch_size
-
-    @property
-    def use_speaker_condition(self) -> bool:
-        # Voice-design checkpoints are caption-driven and intentionally omit
-        # reference-speaker conditioning to avoid the easier shortcut.
-        return not bool(self.use_caption_condition)
 
     @property
     def text_mlp_ratio_resolved(self) -> float:

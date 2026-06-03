@@ -7,7 +7,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
@@ -623,6 +623,17 @@ class InferenceRuntime:
         model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
             Path(key.checkpoint)
         )
+        known_cfg_fields = {f.name for f in fields(ModelConfig)}
+        unknown_cfg_keys = sorted(set(model_cfg_dict) - known_cfg_fields)
+        if unknown_cfg_keys:
+            print(
+                "[irodori] warning: ignoring unknown model_config keys "
+                f"(checkpoint newer than this node?): {unknown_cfg_keys}",
+                flush=True,
+            )
+            model_cfg_dict = {
+                k: v for k, v in model_cfg_dict.items() if k in known_cfg_fields
+            }
         model_cfg = ModelConfig(**model_cfg_dict)
 
         model = TextToLatentRFDiT(model_cfg)
