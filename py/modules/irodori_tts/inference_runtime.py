@@ -787,7 +787,7 @@ class InferenceRuntime:
         messages: list[str],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
-        if not self.model_cfg.use_speaker_condition:
+        if not self.model_cfg.use_speaker_condition_resolved:
             if req.ref_wav is not None or req.ref_latent is not None:
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
@@ -984,7 +984,7 @@ class InferenceRuntime:
             None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
         )
         if speaker_kv_scale is not None:
-            if not self.model_cfg.use_speaker_condition:
+            if not self.model_cfg.use_speaker_condition_resolved:
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
                 )
@@ -1016,7 +1016,7 @@ class InferenceRuntime:
             cfg_scale_speaker=req.cfg_scale_speaker,
             cfg_scale=req.cfg_scale,
             use_caption_condition=has_caption_text,
-            use_speaker_condition=self.model_cfg.use_speaker_condition,
+            use_speaker_condition=self.model_cfg.use_speaker_condition_resolved,
         )
         messages.extend(scale_messages)
         for msg in scale_messages:
@@ -1104,8 +1104,13 @@ class InferenceRuntime:
                     has_speaker_duration = torch.zeros(
                         (num_candidates,), dtype=torch.bool, device=self.model_device
                     )
-                    if self.model_cfg.use_speaker_condition and ref_mask is not None:
+                    if self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
                         has_speaker_duration = ref_mask.any(dim=1)
+                    has_caption_duration = torch.zeros(
+                        (num_candidates,), dtype=torch.bool, device=self.model_device
+                    )
+                    if self.model_cfg.use_caption_condition and caption_mask is not None:
+                        has_caption_duration = caption_mask.any(dim=1)
                     duration_features = build_duration_features(
                         [normalized_text] * num_candidates,
                         token_counts=text_mask.sum(dim=1),
@@ -1134,6 +1139,9 @@ class InferenceRuntime:
                         speaker_mask=_duration_speaker_mask,
                         duration_features=duration_features,
                         has_speaker=has_speaker_duration,
+                        caption_state=_duration_caption_state,
+                        caption_mask=_duration_caption_mask,
+                        has_caption=has_caption_duration,
                     )
                     pred_frames = torch.expm1(pred_log_frames).float().mean().item()
                     scaled_frames = pred_frames * duration_scale

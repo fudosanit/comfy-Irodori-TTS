@@ -6,8 +6,10 @@ from dataclasses import asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from .config import ModelConfig
+from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES, SpeakerInversionEmbedding
 
 DURATION_SPEAKER_FUSIONS = {
     "concat",
@@ -16,7 +18,13 @@ DURATION_SPEAKER_FUSIONS = {
     "speaker_cross_attn",
     "text_cross_attn",
 }
-DURATION_ARCHITECTURES = {"pooled", "token_sum_adarn_zero_no_aux"}
+DURATION_CAPTION_FUSIONS = {"adarn_zero"}
+DURATION_CAPTION_POOLINGS = {"masked_mean"}
+DURATION_ARCHITECTURES = {
+    "pooled",
+    "token_sum_adarn_zero_no_aux",
+    "token_sum_dual_adarn_zero_no_aux",
+}
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -542,6 +550,7 @@ class DurationSwiGLUBlock(nn.Module):
         dropout: float,
         norm_eps: float,
         cond_dim: int | None = None,
+        caption_cond_dim: int | None = None,
     ):
         super().__init__()
         self.norm = RMSNorm(dim, eps=norm_eps)
@@ -553,13 +562,42 @@ class DurationSwiGLUBlock(nn.Module):
             self.modulation = nn.Linear(cond_dim, dim * 3, bias=True)
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
+        self.caption_cond_dim = caption_cond_dim
+        self.caption_modulation = None
+        if caption_cond_dim is not None:
+            self.caption_modulation = nn.Linear(caption_cond_dim, dim * 3, bias=True)
+            nn.init.zeros_(self.caption_modulation.weight)
+            nn.init.zeros_(self.caption_modulation.bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        caption_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         h = self.norm(x)
-        if self.modulation is not None:
-            if cond is None:
-                raise ValueError("cond is required for AdaRN-Zero duration blocks.")
-            shift, scale, gate = self.modulation(F.silu(cond)).chunk(3, dim=-1)
+        if self.modulation is not None or self.caption_modulation is not None:
+            shift = scale = gate = None
+            if self.modulation is not None:
+                if cond is None:
+                    raise ValueError("cond is required for AdaRN-Zero duration blocks.")
+                shift, scale, gate = self.modulation(F.silu(cond)).chunk(3, dim=-1)
+            if self.caption_modulation is not None:
+                if caption_cond is None:
+                    raise ValueError(
+                        "caption_cond is required for caption AdaRN-Zero duration blocks."
+                    )
+                caption_shift, caption_scale, caption_gate = self.caption_modulation(
+                    F.silu(caption_cond)
+                ).chunk(3, dim=-1)
+                if shift is None:
+                    shift, scale, gate = caption_shift, caption_scale, caption_gate
+                else:
+                    shift = shift + caption_shift
+                    scale = scale + caption_scale
+                    gate = gate + caption_gate
+            if shift is None or scale is None or gate is None:
+                raise RuntimeError("Duration block modulation state is incomplete.")
             if h.ndim == 3 and shift.ndim == 2:
                 shift = shift.unsqueeze(1)
                 scale = scale.unsqueeze(1)
@@ -685,7 +723,7 @@ class DiffusionBlock(nn.Module):
             cfg.model_dim,
             cfg.num_heads,
             cfg.text_dim,
-            cfg.speaker_dim if cfg.use_speaker_condition else None,
+            cfg.speaker_dim if cfg.use_speaker_condition_resolved else None,
             cfg.caption_dim_resolved if cfg.use_caption_condition else None,
             norm_eps=cfg.norm_eps,
         )
@@ -750,6 +788,9 @@ class DurationPredictor(nn.Module):
         dropout: float,
         speaker_dim: int | None = None,
         speaker_fusion: str = "concat",
+        caption_dim: int | None = None,
+        caption_fusion: str = "adarn_zero",
+        caption_pooling: str = "masked_mean",
         attention_heads: int = 8,
         norm_eps: float = 1e-5,
         architecture: str = "pooled",
@@ -766,11 +807,25 @@ class DurationPredictor(nn.Module):
             raise ValueError(f"duration predictor layers must be > 0, got {layers}")
         if speaker_dim is not None and speaker_dim <= 0:
             raise ValueError(f"duration predictor speaker_dim must be > 0, got {speaker_dim}")
+        if caption_dim is not None and caption_dim <= 0:
+            raise ValueError(f"duration predictor caption_dim must be > 0, got {caption_dim}")
         speaker_fusion = str(speaker_fusion).strip().lower()
         if speaker_fusion not in DURATION_SPEAKER_FUSIONS:
             raise ValueError(
                 f"duration speaker fusion must be one of {sorted(DURATION_SPEAKER_FUSIONS)}, "
                 f"got {speaker_fusion!r}"
+            )
+        caption_fusion = str(caption_fusion).strip().lower()
+        if caption_fusion not in DURATION_CAPTION_FUSIONS:
+            raise ValueError(
+                f"duration caption fusion must be one of {sorted(DURATION_CAPTION_FUSIONS)}, "
+                f"got {caption_fusion!r}"
+            )
+        caption_pooling = str(caption_pooling).strip().lower()
+        if caption_pooling not in DURATION_CAPTION_POOLINGS:
+            raise ValueError(
+                f"duration caption pooling must be one of {sorted(DURATION_CAPTION_POOLINGS)}, "
+                f"got {caption_pooling!r}"
             )
         architecture = str(architecture).strip().lower()
         if architecture not in DURATION_ARCHITECTURES:
@@ -783,13 +838,9 @@ class DurationPredictor(nn.Module):
                 f"duration predictor attention_heads must be > 0, got {attention_heads}"
             )
         if token_init_frames <= 0:
-            raise ValueError(
-                f"duration token_init_frames must be > 0, got {token_init_frames}"
-            )
+            raise ValueError(f"duration token_init_frames must be > 0, got {token_init_frames}")
         if speaker_dim is None and speaker_fusion != "concat":
-            raise ValueError(
-                f"duration speaker fusion {speaker_fusion!r} requires speaker_dim."
-            )
+            raise ValueError(f"duration speaker fusion {speaker_fusion!r} requires speaker_dim.")
         if architecture == "token_sum_adarn_zero_no_aux" and speaker_dim is None:
             raise ValueError("token_sum_adarn_zero_no_aux requires speaker_dim.")
         if architecture == "token_sum_adarn_zero_no_aux" and speaker_fusion != "adarn_zero":
@@ -797,16 +848,38 @@ class DurationPredictor(nn.Module):
                 "token_sum_adarn_zero_no_aux uses block-level speaker AdaRN-Zero and "
                 "requires speaker_fusion='adarn_zero'."
             )
+        if architecture == "token_sum_dual_adarn_zero_no_aux" and (
+            speaker_dim is None or caption_dim is None
+        ):
+            raise ValueError(
+                "token_sum_dual_adarn_zero_no_aux requires speaker_dim and caption_dim."
+            )
+        if architecture == "token_sum_dual_adarn_zero_no_aux" and speaker_fusion != "adarn_zero":
+            raise ValueError(
+                "token_sum_dual_adarn_zero_no_aux uses block-level speaker AdaRN-Zero and "
+                "requires speaker_fusion='adarn_zero'."
+            )
+        if architecture == "token_sum_dual_adarn_zero_no_aux" and caption_fusion != "adarn_zero":
+            raise ValueError(
+                "token_sum_dual_adarn_zero_no_aux uses block-level caption AdaRN-Zero and "
+                "requires caption_fusion='adarn_zero'."
+            )
 
         self.text_dim = int(text_dim)
         self.aux_dim = int(aux_dim)
         self.hidden_dim = int(hidden_dim)
         self.speaker_dim = None if speaker_dim is None else int(speaker_dim)
         self.speaker_fusion = speaker_fusion
+        self.caption_dim = None if caption_dim is None else int(caption_dim)
+        self.caption_fusion = caption_fusion
+        self.caption_pooling = caption_pooling
         self.duration_architecture = architecture
         self.text_pool = None
         self.null_speaker = (
             nn.Parameter(torch.zeros(int(speaker_dim))) if speaker_dim is not None else None
+        )
+        self.null_caption = (
+            nn.Parameter(torch.zeros(int(caption_dim))) if caption_dim is not None else None
         )
         self.text_adarn_norm = None
         self.text_adarn = None
@@ -817,7 +890,10 @@ class DurationPredictor(nn.Module):
         self.token_out_norm = None
         self.token_out_proj = None
 
-        if architecture == "token_sum_adarn_zero_no_aux":
+        if architecture in {
+            "token_sum_adarn_zero_no_aux",
+            "token_sum_dual_adarn_zero_no_aux",
+        }:
             self.token_input_proj = nn.Linear(int(text_dim), int(hidden_dim))
             self.token_blocks = nn.ModuleList(
                 DurationSwiGLUBlock(
@@ -826,6 +902,11 @@ class DurationPredictor(nn.Module):
                     dropout=float(dropout),
                     norm_eps=float(norm_eps),
                     cond_dim=int(speaker_dim),
+                    caption_cond_dim=(
+                        int(caption_dim)
+                        if architecture == "token_sum_dual_adarn_zero_no_aux"
+                        else None
+                    ),
                 )
                 for _ in range(int(layers))
             )
@@ -904,9 +985,7 @@ class DurationPredictor(nn.Module):
     ) -> torch.Tensor:
         if self.null_speaker is None or self.speaker_dim is None:
             raise RuntimeError("Duration speaker modules are missing.")
-        null_vec = self.null_speaker.to(device=device, dtype=dtype)[None, :].expand(
-            batch_size, -1
-        )
+        null_vec = self.null_speaker.to(device=device, dtype=dtype)[None, :].expand(batch_size, -1)
         if speaker_state is None:
             return null_vec
         if speaker_state.ndim != 3 or speaker_state.shape[0] != batch_size:
@@ -919,6 +998,45 @@ class DurationPredictor(nn.Module):
             )
         speaker_vec = speaker_state[:, 0].to(device=device, dtype=dtype)
         return torch.where(has_speaker[:, None], speaker_vec, null_vec)
+
+    def _caption_vec(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        caption_state: torch.Tensor | None,
+        caption_mask: torch.Tensor | None,
+        has_caption: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.null_caption is None or self.caption_dim is None:
+            raise RuntimeError("Duration caption modules are missing.")
+        null_vec = self.null_caption.to(device=device, dtype=dtype)[None, :].expand(batch_size, -1)
+        if caption_state is None:
+            return null_vec
+        if caption_state.ndim != 3 or caption_state.shape[0] != batch_size:
+            raise ValueError(
+                f"caption_state must have shape (B, S, D), got {tuple(caption_state.shape)}"
+            )
+        if caption_state.shape[-1] != self.caption_dim:
+            raise ValueError(
+                f"caption_state last dim must be {self.caption_dim}, got {caption_state.shape[-1]}"
+            )
+        caption_state = caption_state.to(device=device, dtype=dtype)
+        if caption_mask is None:
+            caption_mask = torch.ones(
+                (batch_size, caption_state.shape[1]), dtype=torch.bool, device=device
+            )
+        elif caption_mask.ndim != 2 or caption_mask.shape[:2] != caption_state.shape[:2]:
+            raise ValueError(
+                "caption_mask must have shape matching caption_state (B, S), "
+                f"got caption_state={tuple(caption_state.shape)} mask={tuple(caption_mask.shape)}"
+            )
+        caption_mask = caption_mask.to(device=device, dtype=torch.bool) & has_caption[:, None]
+        caption_mask_f = caption_mask.unsqueeze(-1).to(dtype=caption_state.dtype)
+        denom = caption_mask_f.sum(dim=1).clamp_min(1.0)
+        caption_vec = (caption_state * caption_mask_f).sum(dim=1) / denom
+        return torch.where(caption_mask.any(dim=1, keepdim=True), caption_vec, null_vec)
 
     def _speaker_sequence(
         self,
@@ -964,23 +1082,24 @@ class DurationPredictor(nn.Module):
 
     def forward(
         self,
-        *,
         text_state: torch.Tensor,
+        *,
         text_mask: torch.Tensor,
         aux_features: torch.Tensor,
         speaker_state: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         has_speaker: torch.Tensor | None = None,
+        caption_state: torch.Tensor | None = None,
+        caption_mask: torch.Tensor | None = None,
+        has_caption: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_state.ndim != 3 or text_state.shape[-1] != self.text_dim:
             raise ValueError(
-                f"text_state must have shape (B, S, {self.text_dim}), "
-                f"got {tuple(text_state.shape)}"
+                f"text_state must have shape (B, S, {self.text_dim}), got {tuple(text_state.shape)}"
             )
         if aux_features.ndim != 2 or aux_features.shape[1] != self.aux_dim:
             raise ValueError(
-                f"aux_features must have shape (B, {self.aux_dim}), "
-                f"got {tuple(aux_features.shape)}"
+                f"aux_features must have shape (B, {self.aux_dim}), got {tuple(aux_features.shape)}"
             )
         if aux_features.shape[0] != text_state.shape[0]:
             raise ValueError(
@@ -990,7 +1109,10 @@ class DurationPredictor(nn.Module):
         text_state, text_mask = _safe_attention_mask(text_state, text_mask)
         aux_features = aux_features.to(device=text_state.device, dtype=text_state.dtype)
 
-        if self.duration_architecture == "token_sum_adarn_zero_no_aux":
+        if self.duration_architecture in {
+            "token_sum_adarn_zero_no_aux",
+            "token_sum_dual_adarn_zero_no_aux",
+        }:
             if self.speaker_dim is None:
                 raise RuntimeError("Token-sum duration architecture requires speaker modules.")
             if has_speaker is None:
@@ -1009,6 +1131,29 @@ class DurationPredictor(nn.Module):
                 speaker_state=speaker_state,
                 has_speaker=has_speaker,
             )
+            caption_vec = None
+            if self.duration_architecture == "token_sum_dual_adarn_zero_no_aux":
+                if self.caption_dim is None:
+                    raise RuntimeError(
+                        "Dual token-sum duration architecture requires caption modules."
+                    )
+                if has_caption is None:
+                    raise ValueError(
+                        "has_caption is required for caption-conditioned duration prediction."
+                    )
+                has_caption = has_caption.to(device=text_state.device, dtype=torch.bool)
+                if has_caption.ndim != 1 or has_caption.shape[0] != text_state.shape[0]:
+                    raise ValueError(
+                        f"has_caption must have shape (B,), got {tuple(has_caption.shape)}"
+                    )
+                caption_vec = self._caption_vec(
+                    batch_size=text_state.shape[0],
+                    device=text_state.device,
+                    dtype=text_state.dtype,
+                    caption_state=caption_state,
+                    caption_mask=caption_mask,
+                    has_caption=has_caption,
+                )
             if (
                 self.token_input_proj is None
                 or self.token_blocks is None
@@ -1018,7 +1163,7 @@ class DurationPredictor(nn.Module):
                 raise RuntimeError("Token-sum duration modules are missing.")
             h = self.token_input_proj(text_state)
             for block in self.token_blocks:
-                h = block(h, cond=speaker_vec)
+                h = block(h, cond=speaker_vec, caption_cond=caption_vec)
             token_logits = self.token_out_proj(self.token_out_norm(h)).squeeze(-1)
             token_frames = F.softplus(token_logits.float())
             total_frames = (token_frames * text_mask.to(dtype=token_frames.dtype)).sum(dim=1)
@@ -1038,9 +1183,7 @@ class DurationPredictor(nn.Module):
             raise ValueError("has_speaker is required for speaker-conditioned duration prediction.")
         has_speaker = has_speaker.to(device=text_vec.device, dtype=torch.bool)
         if has_speaker.ndim != 1 or has_speaker.shape[0] != text_vec.shape[0]:
-            raise ValueError(
-                f"has_speaker must have shape (B,), got {tuple(has_speaker.shape)}"
-            )
+            raise ValueError(f"has_speaker must have shape (B,), got {tuple(has_speaker.shape)}")
         speaker_vec = self._speaker_vec(
             batch_size=text_vec.shape[0],
             device=text_vec.device,
@@ -1133,17 +1276,20 @@ class TextToLatentRFDiT(nn.Module):
             )
             self.caption_norm = RMSNorm(cfg.caption_dim_resolved, eps=cfg.norm_eps)
         self.speaker_encoder = None
-        if cfg.use_speaker_condition:
+        if cfg.use_speaker_condition_resolved:
             self.speaker_encoder = ReferenceLatentEncoder(cfg)
         self.text_norm = RMSNorm(cfg.text_dim, eps=cfg.norm_eps)
         self.speaker_norm = None
-        if cfg.use_speaker_condition:
+        if cfg.use_speaker_condition_resolved:
             self.speaker_norm = RMSNorm(cfg.speaker_dim, eps=cfg.norm_eps)
         self.duration_predictor = None
         if cfg.use_duration_predictor:
             duration_speaker_dim = None
-            if cfg.use_speaker_condition:
+            if cfg.use_speaker_condition_resolved:
                 duration_speaker_dim = int(cfg.speaker_dim)
+            duration_caption_dim = None
+            if cfg.use_caption_condition:
+                duration_caption_dim = int(cfg.caption_dim_resolved)
             self.duration_predictor = DurationPredictor(
                 text_dim=cfg.text_dim,
                 aux_dim=cfg.duration_aux_dim,
@@ -1152,6 +1298,9 @@ class TextToLatentRFDiT(nn.Module):
                 dropout=cfg.duration_dropout,
                 speaker_dim=duration_speaker_dim,
                 speaker_fusion=cfg.duration_speaker_fusion,
+                caption_dim=duration_caption_dim,
+                caption_fusion=cfg.duration_caption_fusion,
+                caption_pooling=cfg.duration_caption_pooling,
                 attention_heads=cfg.duration_attention_heads,
                 norm_eps=cfg.norm_eps,
                 architecture=cfg.duration_architecture,
@@ -1168,6 +1317,7 @@ class TextToLatentRFDiT(nn.Module):
 
         self.in_proj = nn.Linear(cfg.patched_latent_dim, cfg.model_dim)
         self.blocks = nn.ModuleList(DiffusionBlock(cfg) for _ in range(cfg.num_layers))
+        self.gradient_checkpointing = False
         self.out_norm = RMSNorm(cfg.model_dim, eps=cfg.norm_eps)
         self.out_proj = nn.Linear(cfg.model_dim, cfg.patched_latent_dim)
         # Echo/JAX training initializes decoder out projection to zero for stable early training.
@@ -1181,6 +1331,27 @@ class TextToLatentRFDiT(nn.Module):
         self.register_buffer(
             "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
         )
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = bool(enabled)
+
+    def enable_speaker_inversion(
+        self,
+        *,
+        num_tokens: int,
+        init_std: float,
+        init_embedding: torch.Tensor | None = None,
+    ) -> SpeakerInversionEmbedding:
+        if not self.cfg.use_speaker_condition_resolved:
+            raise ValueError("Speaker inversion requires model speaker conditioning to be enabled.")
+        module = SpeakerInversionEmbedding(
+            num_tokens=int(num_tokens),
+            speaker_dim=int(self.cfg.speaker_dim),
+            init_std=float(init_std),
+            init_embedding=init_embedding,
+        )
+        self.speaker_inversion = module
+        return module
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -1205,6 +1376,100 @@ class TextToLatentRFDiT(nn.Module):
         mask = torch.cat([has_any, mask], dim=1)
         return state, mask
 
+    @staticmethod
+    def _expand_speaker_condition_batch(
+        state: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        speaker_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if state.ndim == 2:
+            state = state.unsqueeze(0)
+        if state.ndim != 3:
+            raise ValueError(
+                f"speaker_state must have shape (B,S,D) or (S,D), got {tuple(state.shape)}"
+            )
+        if int(state.shape[-1]) != int(speaker_dim):
+            raise ValueError(
+                f"speaker_state last dim must be {int(speaker_dim)}, got {int(state.shape[-1])}"
+            )
+        if state.shape[0] == 1 and batch_size != 1:
+            state = state.expand(batch_size, -1, -1)
+        elif int(state.shape[0]) != int(batch_size):
+            raise ValueError(
+                f"speaker_state batch mismatch: expected {int(batch_size)}, got {int(state.shape[0])}"
+            )
+
+        if mask is None:
+            mask = torch.ones(state.shape[:2], dtype=torch.bool, device=state.device)
+        else:
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0)
+            if mask.ndim != 2:
+                raise ValueError(
+                    f"speaker_mask must have shape (B,S) or (S,), got {tuple(mask.shape)}"
+                )
+            if mask.shape[0] == 1 and batch_size != 1:
+                mask = mask.expand(batch_size, -1)
+            elif int(mask.shape[0]) != int(batch_size):
+                raise ValueError(
+                    f"speaker_mask batch mismatch: expected {int(batch_size)}, got {int(mask.shape[0])}"
+                )
+            if int(mask.shape[1]) != int(state.shape[1]):
+                raise ValueError(
+                    "speaker_mask token mismatch: "
+                    f"state={tuple(state.shape)} mask={tuple(mask.shape)}"
+                )
+            mask = mask.to(device=state.device, dtype=torch.bool)
+        return state, mask
+
+    def _apply_speaker_condition_dropout(
+        self,
+        *,
+        speaker_state: torch.Tensor,
+        speaker_mask: torch.Tensor,
+        dropout_mask: torch.Tensor | None,
+        uncond_state: torch.Tensor | None,
+        uncond_mask: torch.Tensor | None,
+        uncond_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if dropout_mask is None:
+            return speaker_state, speaker_mask
+        dropout_mask = dropout_mask.to(device=speaker_state.device, dtype=torch.bool)
+        if dropout_mask.ndim != 1 or dropout_mask.shape[0] != speaker_state.shape[0]:
+            raise ValueError(
+                "speaker_condition_dropout must have shape (B,), "
+                f"got {tuple(dropout_mask.shape)} for speaker_state={tuple(speaker_state.shape)}"
+            )
+        mode = str(uncond_mode).strip().lower()
+        if mode not in SPEAKER_INVERSION_UNCOND_MODES:
+            raise ValueError(
+                f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, "
+                f"got {uncond_mode!r}"
+            )
+        if mode == "noise":
+            if uncond_state is None:
+                scale = speaker_state.detach().std().clamp_min(1e-6)
+                uncond_state = torch.randn_like(speaker_state) * scale
+            if uncond_mask is None:
+                uncond_mask = torch.ones_like(speaker_mask)
+            uncond_state, uncond_mask = self._expand_speaker_condition_batch(
+                uncond_state,
+                uncond_mask,
+                batch_size=speaker_state.shape[0],
+                speaker_dim=self.cfg.speaker_dim,
+            )
+            uncond_state = uncond_state.to(device=speaker_state.device, dtype=speaker_state.dtype)
+            uncond_mask = uncond_mask.to(device=speaker_state.device, dtype=torch.bool)
+            speaker_state = torch.where(dropout_mask[:, None, None], uncond_state, speaker_state)
+            speaker_mask = torch.where(dropout_mask[:, None], uncond_mask, speaker_mask)
+            return speaker_state, speaker_mask
+
+        speaker_mask = speaker_mask.clone()
+        speaker_mask[dropout_mask] = False
+        return speaker_state, speaker_mask
+
     def encode_conditions(
         self,
         text_input_ids: torch.Tensor,
@@ -1213,6 +1478,9 @@ class TextToLatentRFDiT(nn.Module):
         ref_mask: torch.Tensor | None,
         caption_input_ids: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
+        speaker_state_override: torch.Tensor | None = None,
+        speaker_mask_override: torch.Tensor | None = None,
+        speaker_uncond_mode: str = "mask",
         text_condition_dropout: torch.Tensor | None = None,
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
@@ -1227,18 +1495,25 @@ class TextToLatentRFDiT(nn.Module):
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
             text_mask[text_condition_dropout] = False
-        if self.cfg.use_speaker_condition:
-            if self.speaker_encoder is None or self.speaker_norm is None:
+        if self.cfg.use_speaker_condition_resolved:
+            speaker_inversion = getattr(self, "speaker_inversion", None)
+            has_direct_speaker = speaker_state_override is not None or isinstance(
+                speaker_inversion, SpeakerInversionEmbedding
+            )
+            if not has_direct_speaker and (
+                self.speaker_encoder is None or self.speaker_norm is None
+            ):
                 raise RuntimeError(
                     "Speaker conditioning is enabled but speaker modules are missing."
                 )
-            if ref_latent is None or ref_mask is None:
+            if not has_direct_speaker and (ref_latent is None or ref_mask is None):
                 raise ValueError(
                     "ref_latent and ref_mask are required when speaker conditioning is enabled."
                 )
-            if speaker_condition_dropout is not None:
-                ref_mask = ref_mask.clone()
-                ref_mask[speaker_condition_dropout] = False
+        elif speaker_state_override is not None:
+            raise ValueError(
+                "speaker_state_override was provided but speaker conditioning is disabled."
+            )
         if self.cfg.use_caption_condition:
             if self.caption_encoder is None or self.caption_norm is None:
                 raise RuntimeError(
@@ -1255,15 +1530,41 @@ class TextToLatentRFDiT(nn.Module):
         text_state = self.text_encoder(text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
         ref_state = None
-        if self.cfg.use_speaker_condition:
-            ref_latent, ref_mask = patch_sequence_with_mask(
-                seq=ref_latent,
-                mask=ref_mask,
-                patch_size=self.cfg.speaker_patch_size,
+        if self.cfg.use_speaker_condition_resolved:
+            if speaker_state_override is not None:
+                ref_state, ref_mask = self._expand_speaker_condition_batch(
+                    speaker_state_override,
+                    speaker_mask_override,
+                    batch_size=text_input_ids.shape[0],
+                    speaker_dim=self.cfg.speaker_dim,
+                )
+                ref_state = ref_state.to(device=text_state.device, dtype=text_state.dtype)
+                ref_mask = ref_mask.to(device=text_state.device, dtype=torch.bool)
+            else:
+                speaker_inversion = getattr(self, "speaker_inversion", None)
+                if isinstance(speaker_inversion, SpeakerInversionEmbedding):
+                    ref_state, ref_mask = speaker_inversion(
+                        batch_size=text_input_ids.shape[0],
+                        device=text_state.device,
+                        dtype=text_state.dtype,
+                    )
+                else:
+                    ref_latent, ref_mask = patch_sequence_with_mask(
+                        seq=ref_latent,
+                        mask=ref_mask,
+                        patch_size=self.cfg.speaker_patch_size,
+                    )
+                    ref_state = self.speaker_encoder(ref_latent, ref_mask)
+                    ref_state = self.speaker_norm(ref_state)
+                    ref_state, ref_mask = self._prepend_masked_mean_token(ref_state, ref_mask)
+            ref_state, ref_mask = self._apply_speaker_condition_dropout(
+                speaker_state=ref_state,
+                speaker_mask=ref_mask,
+                dropout_mask=speaker_condition_dropout,
+                uncond_state=None,
+                uncond_mask=None,
+                uncond_mode=speaker_uncond_mode,
             )
-            ref_state = self.speaker_encoder(ref_latent, ref_mask)
-            ref_state = self.speaker_norm(ref_state)
-            ref_state, ref_mask = self._prepend_masked_mean_token(ref_state, ref_mask)
         caption_state = None
         if self.cfg.use_caption_condition:
             caption_state = self.caption_encoder(caption_input_ids, caption_mask)
@@ -1289,20 +1590,38 @@ class TextToLatentRFDiT(nn.Module):
 
         x = self.in_proj(x_t)
         freqs = self._rope_freqs(x.shape[1], x.device)
+        use_checkpoint = self.gradient_checkpointing and self.training and context_kv_cache is None
         for i, block in enumerate(self.blocks):
-            x = block(
-                x=x,
-                cond_embed=cond_embed,
-                text_state=text_state,
-                text_mask=text_mask,
-                speaker_state=speaker_state,
-                speaker_mask=speaker_mask,
-                caption_state=caption_state,
-                caption_mask=caption_mask,
-                freqs_cis=freqs,
-                self_mask=latent_mask,
-                context_kv=context_kv_cache[i] if context_kv_cache is not None else None,
-            )
+            context_kv = context_kv_cache[i] if context_kv_cache is not None else None
+            if use_checkpoint:
+                x = _torch_checkpoint(
+                    block,
+                    x,
+                    cond_embed,
+                    text_state,
+                    text_mask,
+                    speaker_state,
+                    speaker_mask,
+                    caption_state,
+                    caption_mask,
+                    freqs,
+                    latent_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x=x,
+                    cond_embed=cond_embed,
+                    text_state=text_state,
+                    text_mask=text_mask,
+                    speaker_state=speaker_state,
+                    speaker_mask=speaker_mask,
+                    caption_state=caption_state,
+                    caption_mask=caption_mask,
+                    freqs_cis=freqs,
+                    self_mask=latent_mask,
+                    context_kv=context_kv,
+                )
 
         x = self.out_norm(x)
         x = self.out_proj(x)
@@ -1324,6 +1643,7 @@ class TextToLatentRFDiT(nn.Module):
         caption_condition_dropout: torch.Tensor | None = None,
         duration_features: torch.Tensor | None = None,
         duration_has_speaker: torch.Tensor | None = None,
+        duration_has_caption: torch.Tensor | None = None,
         duration_only: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if duration_features is not None:
@@ -1348,21 +1668,35 @@ class TextToLatentRFDiT(nn.Module):
                     text_mask=text_mask_full,
                     speaker_state=speaker_state,
                     speaker_mask=speaker_mask_full,
+                    caption_state=caption_state,
+                    caption_mask=caption_mask_full,
                     duration_features=duration_features,
                     has_speaker=duration_has_speaker,
+                    has_caption=duration_has_caption,
                 )
 
             if x_t is None or t is None:
                 raise ValueError("x_t and t are required unless duration_only=True.")
             text_mask_dit = text_mask_full
+            speaker_state_dit = speaker_state
             speaker_mask_dit = speaker_mask_full
             caption_mask_dit = caption_mask_full
             if text_condition_dropout is not None:
                 text_mask_dit = text_mask_dit.clone()
                 text_mask_dit[text_condition_dropout] = False
-            if speaker_condition_dropout is not None and speaker_mask_dit is not None:
-                speaker_mask_dit = speaker_mask_dit.clone()
-                speaker_mask_dit[speaker_condition_dropout] = False
+            if (
+                speaker_condition_dropout is not None
+                and speaker_state_dit is not None
+                and speaker_mask_dit is not None
+            ):
+                speaker_state_dit, speaker_mask_dit = self._apply_speaker_condition_dropout(
+                    speaker_state=speaker_state_dit,
+                    speaker_mask=speaker_mask_dit,
+                    dropout_mask=speaker_condition_dropout,
+                    uncond_state=None,
+                    uncond_mask=None,
+                    uncond_mode="mask",
+                )
             if caption_condition_dropout is not None and caption_mask_dit is not None:
                 caption_mask_dit = caption_mask_dit.clone()
                 caption_mask_dit[caption_condition_dropout] = False
@@ -1372,7 +1706,7 @@ class TextToLatentRFDiT(nn.Module):
                 t=t,
                 text_state=text_state,
                 text_mask=text_mask_dit,
-                speaker_state=speaker_state,
+                speaker_state=speaker_state_dit,
                 speaker_mask=speaker_mask_dit,
                 caption_state=caption_state,
                 caption_mask=caption_mask_dit,
@@ -1383,8 +1717,11 @@ class TextToLatentRFDiT(nn.Module):
                 text_mask=text_mask_full,
                 speaker_state=speaker_state,
                 speaker_mask=speaker_mask_full,
+                caption_state=caption_state,
+                caption_mask=caption_mask_full,
                 duration_features=duration_features,
                 has_speaker=duration_has_speaker,
+                has_caption=duration_has_caption,
             )
             return v_pred, duration_pred
 
@@ -1456,6 +1793,9 @@ class TextToLatentRFDiT(nn.Module):
         speaker_mask: torch.Tensor | None,
         duration_features: torch.Tensor,
         has_speaker: torch.Tensor | None,
+        caption_state: torch.Tensor | None = None,
+        caption_mask: torch.Tensor | None = None,
+        has_caption: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.duration_predictor is None:
             raise RuntimeError("Duration predictor is disabled for this model.")
@@ -1470,12 +1810,15 @@ class TextToLatentRFDiT(nn.Module):
             )
 
         pred = self.duration_predictor(
-            text_state=text_state.detach(),
+            text_state.detach(),
             text_mask=text_mask,
             aux_features=duration_features,
             speaker_state=None if speaker_state is None else speaker_state.detach(),
             speaker_mask=speaker_mask,
             has_speaker=has_speaker,
+            caption_state=None if caption_state is None else caption_state.detach(),
+            caption_mask=caption_mask,
+            has_caption=has_caption,
         )
         return pred.float()
 
