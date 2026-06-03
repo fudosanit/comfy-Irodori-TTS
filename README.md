@@ -1,3 +1,5 @@
+> **Fork notice:** このリポジトリは [jupo-ai/comfy-Irodori-TTS](https://github.com/jupo-ai/comfy-Irodori-TTS) のフォークです。`Aratako/Irodori-TTS-600M-v3-VoiceDesign` などの v3 モデルに対応するための変更を加えています。
+
 # comfy_IrodoriTTS
 
 ComfyUIで[Irodori-TTS](https://github.com/Aratako/Irodori-TTS)を使うためのカスタムノードです。
