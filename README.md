@@ -1,4 +1,4 @@
-> **Fork notice:** このリポジトリは [jupo-ai/comfy-Irodori-TTS](https://github.com/jupo-ai/comfy-Irodori-TTS) のフォークです。`Aratako/Irodori-TTS-600M-v3-VoiceDesign` などの v3 モデルに対応するための変更を加えています。
+> **Fork notice:** このリポジトリは [jupo-ai/comfy-Irodori-TTS](https://github.com/jupo-ai/comfy-Irodori-TTS) のフォークです。`Aratako/Irodori-TTS-600M-v3-VoiceDesign` などの v3 モデル、および `Aratako/Irodori-TTS-v4-Small`（ModernBERT-jaテキストエンコーダの v4 世代）に対応するための変更を加えています。v4 対応にあたり本体エンジンを [Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS) main（v4）相当へ更新しつつ、環境の `transformers` を 5.x に上げなくても動くよう互換シムを入れています（`transformers>=4.48,<5`）。
 
 # comfy_IrodoriTTS
 
@@ -53,10 +53,14 @@ IrodoriTTSのモデルはComfyUI標準の`checkpoints`一覧から選択しま�
 
 チェックポイント例:
 
+- [Aratako/Irodori-TTS-v4-Small](https://huggingface.co/Aratako/Irodori-TTS-v4-Small)（**v4**。ModernBERT-jaエンコーダ / 32-dim Semantic-DACVAE / 秒数自動推定。テキスト・参照音声・キャプションの3系統条件に対応）
+- [Aratako/Irodori-TTS-600M-v3-VoiceDesign](https://huggingface.co/Aratako/Irodori-TTS-600M-v3-VoiceDesign)
 - [Aratako/Irodori-TTS-500M-v3](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
 - [Aratako/Irodori-TTS-500M-v2](https://huggingface.co/Aratako/Irodori-TTS-500M-v2)
 - [Aratako/Irodori-TTS-500M-v2-VoiceDesign](https://huggingface.co/Aratako/Irodori-TTS-500M-v2-VoiceDesign)
 - [Aratako/Irodori-TTS-500M](https://huggingface.co/Aratako/Irodori-TTS-500M)
+
+> **v4-Small を使う場合:** チェックポイント（`model.safetensors`）をリネームして `checkpoints` に置くとともに、リポジトリ同梱の `tokenizer/` ディレクトリを**チェックポイントと同じ場所に隣接配置**してください（例: `models/checkpoints/tts/Irodori-TTS-v4-Small.safetensors` と `models/checkpoints/tts/tokenizer/`）。v4 のトークナイザはHF自動DLではなくチェックポイント同梱のものを参照します。codec は従来どおり初回に自動ダウンロードされます。`seconds = 0` で秒数の自動推定が使えます。
 
 チェックポイントの`latent_dim`に応じて、内部で使用するcodecが自動選択されます。
 
