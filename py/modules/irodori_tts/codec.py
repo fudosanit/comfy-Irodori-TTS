@@ -6,39 +6,9 @@ from pathlib import Path
 
 import torch
 import torchaudio
-from huggingface_hub import hf_hub_download, list_repo_files
-
-from ..download_progress import download_hf_file_with_progress, download_log
+from huggingface_hub import hf_hub_download
 
 _CODEC_DEFAULT = object()
-
-
-def _hf_download_with_tqdm(repo_id: str, filename: str, cache_dir: Path) -> str:
-    target = cache_dir / filename
-    if target.exists():
-        return str(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        download_hf_file_with_progress(
-            repo_id,
-            filename,
-            cache_dir,
-            item_type="codec",
-        )
-        return str(target)
-    except Exception:
-        with download_log(
-            "codec",
-            f"{repo_id}/{filename}",
-            cache_dir=cache_dir,
-            progress="huggingface",
-        ):
-            return hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=str(cache_dir),
-            )
 
 
 def patchify_latent(latent: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -71,8 +41,6 @@ class DACVAECodec:
     latent_dim: int
     device: torch.device
     dtype: torch.dtype
-    enable_watermark: bool
-    watermark_alpha: float | None
     deterministic_encode: bool
     deterministic_decode: bool
     normalize_db: float | None
@@ -80,105 +48,43 @@ class DACVAECodec:
     @classmethod
     def load(
         cls,
-        repo_id: str = "facebook/dacvae-watermarked",
+        repo_id: str = "Aratako/Semantic-DACVAE-Japanese-32dim",
         device: str = "cuda",
         dtype: torch.dtype | None = None,
-        enable_watermark: bool = False,
-        watermark_alpha: float | None = None,
         deterministic_encode: bool = True,
         deterministic_decode: bool = True,
         normalize_db: float | None = -16.0,
-        local_dir: str | None = None,
     ) -> DACVAECodec:
         # Prefer installed package; fallback to local clone at ../dacvae.
         try:
             from dacvae import DACVAE
         except ImportError:
             local_repo = Path(__file__).resolve().parents[2] / "dacvae"
-            local_repo_str = str(local_repo)
-            inserted_path = False
             if local_repo.exists():
-                inserted_path = local_repo_str not in sys.path
-                if inserted_path:
-                    sys.path.insert(0, local_repo_str)
-            try:
-                from dacvae import DACVAE
-            finally:
-                if inserted_path:
-                    try:
-                        sys.path.remove(local_repo_str)
-                    except ValueError:
-                        pass
+                sys.path.insert(0, str(local_repo))
+            from dacvae import DACVAE
 
-        # Resolve location: local_dir download > hf:// prefix > weights.pth > repo_id passthrough
         location = str(repo_id).strip()
         if location.startswith("hf://"):
-            location = location[len("hf://"):]
-
-        if local_dir is not None:
-            # local_dirが指定されている場合:
-            # 指定repo専用ディレクトリに保存し、別repoの重み混在による取り違えを避ける。
-            cache_dir = Path(local_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-
-            preferred = cache_dir / "weights.pth"
-            if preferred.exists():
-                location = str(preferred)
-            else:
-                try:
-                    repo_files = list(list_repo_files(repo_id))
-                    pth_files = [f for f in repo_files if f.endswith(".pth")]
-                except Exception:
-                    pth_files = []
-
-                if pth_files:
-                    filename = pth_files[0]
-                else:
-                    filename = "weights.pth"
-
-                try:
-                    location = _hf_download_with_tqdm(
-                        repo_id=repo_id,
-                        filename=filename,
-                        cache_dir=cache_dir,
-                    )
-                    print(f"[codec] dacvae: hf://{repo_id}/{filename} -> {location}", flush=True)
-                except Exception:
-                    existing = sorted(cache_dir.glob("*.pth"))
-                    if existing:
-                        location = str(existing[0])
-                    else:
-                        # ダウンロード失敗時はrepo_idをそのままDACVAE.loadに渡す
-                        location = repo_id
-        elif not Path(location).exists() and "/" in location and not location.endswith(".pth"):
-            # hf://なしのrepo_id形式: weights.pthを自動ダウンロード試行
+            location = location[len("hf://") :]
+        if not Path(location).exists() and "/" in location and not location.endswith(".pth"):
             try:
-                with download_log("codec", f"{location}/weights.pth"):
-                    location = hf_hub_download(repo_id=location, filename="weights.pth")
+                location = hf_hub_download(repo_id=location, filename="weights.pth")
                 print(f"[codec] dacvae: hf://{repo_id} -> {location}", flush=True)
             except Exception:
+                # Let DACVAE.load surface a clearer error if this is not a valid path/repo.
                 pass
 
         model = DACVAE.load(location).eval().to(device)
         if dtype is not None:
             model = model.to(dtype=dtype)
 
-        configured_watermark_alpha: float | None = None
-        configured_enable_watermark = False
         decoder = getattr(model, "decoder", None)
         if decoder is not None and hasattr(decoder, "alpha"):
-            default_alpha = float(decoder.alpha)
-            if watermark_alpha is not None:
-                target_alpha = float(watermark_alpha)
-            elif enable_watermark:
-                target_alpha = default_alpha
-            else:
-                target_alpha = 0.0
-            decoder.alpha = float(target_alpha)
-            configured_watermark_alpha = float(decoder.alpha)
-            configured_enable_watermark = configured_watermark_alpha > 0.0
-            if not configured_enable_watermark and hasattr(decoder, "wm_model"):
-                # Keep decode output mono while skipping heavy watermark encode/decode path.
+            decoder.alpha = 0.0
+            if hasattr(decoder, "wm_model"):
+                # Irodori checkpoints were trained without the DACVAE watermark branch.
+                # Keep decode output mono while skipping that encode/decode path.
                 def _watermark_passthrough(
                     x: torch.Tensor,
                     message: torch.Tensor | None = None,
@@ -203,8 +109,6 @@ class DACVAECodec:
             latent_dim=int(z.shape[1]),
             device=torch.device(device),
             dtype=model_dtype,
-            enable_watermark=configured_enable_watermark,
-            watermark_alpha=configured_watermark_alpha,
             deterministic_encode=bool(deterministic_encode),
             deterministic_decode=bool(deterministic_decode),
             normalize_db=None if normalize_db is None else float(normalize_db),
@@ -302,12 +206,15 @@ class DACVAECodec:
             effective_normalize_db = None
         else:
             effective_normalize_db = float(normalize_db)
+        # audiotools normalization already applies ensure_max_of_audio(), so codec-side
+        # peak scaling is only needed when normalization is disabled.
         effective_ensure_max = (
             effective_normalize_db is None and bool(ensure_max) if ensure_max is not None else False
         )
 
         waveform = waveform.to(dtype=torch.float32)
         if effective_normalize_db is not None or effective_ensure_max:
+            # Keep behavior deterministic per utterance by normalizing each waveform independently.
             processed: list[torch.Tensor] = []
             for wav in waveform.squeeze(1):
                 if effective_normalize_db is not None:

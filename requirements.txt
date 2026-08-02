@@ -4,7 +4,11 @@
 
 dacvae @ git+https://github.com/facebookresearch/dacvae
 torchcodec>=0.10.0
-transformers<5
+# v4-Small uses a ModernBERT-ja text encoder (needs transformers>=4.48). We stay on
+# transformers 4.x on purpose: the loader (model.py / tokenizer.py) has 4.x-compat
+# shims for the v5-style no_init_weights import and the "TokenizersBackend" tokenizer_class,
+# so upgrading the whole ComfyUI env to transformers 5.x is not required.
+transformers>=4.48,<5
 sentencepiece>=0.1.99
 soundfile>=0.12.0
 imageio-ffmpeg>=0.5.1

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 
 import torch
 
@@ -67,11 +66,6 @@ def rf_interpolate(x0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> to
 def rf_velocity_target(x0: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
     # For x_t = (1-t) x0 + t z, velocity is d/dt x_t = z - x0.
     return noise - x0
-
-
-def rf_predict_x0(x_t: torch.Tensor, v_pred: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    # x_t = x0 + t * v  =>  x0 = x_t - t * v
-    return x_t - t[:, None, None] * v_pred
 
 
 def temporal_score_rescale(
@@ -149,7 +143,6 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
-    progress_callback: Callable[[int, int], None] | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -587,7 +580,5 @@ def sample_euler_rf_cfg(
             speaker_kv_active = False
 
         x_t = x_t + v * (t_next - t)
-        if progress_callback is not None:
-            progress_callback(i + 1, int(num_steps))
 
     return x_t
